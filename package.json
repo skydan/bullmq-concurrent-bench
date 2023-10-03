@@ -1,0 +1,16 @@
+{
+  "name": "bullmq-concurrent-bench",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@strong-roots-capital/barrier": "^1.0.1",
+    "bullmq": "^4.12.0",
+    "command-line-args": "^5.2.1"
+  }
+}

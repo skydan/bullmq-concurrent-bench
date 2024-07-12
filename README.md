@@ -1,6 +1,8 @@
-# bullmq-concurrent-bench
+# bullmqpro-groups-bench
 
 To install dependencies:
+
+Acquire a trial token from https://taskforce.sh/account/bullmqpro and follow tjeir instructions to configure .npmrc file with it.
 
 ```bash
 bun install
@@ -9,7 +11,6 @@ bun install
 To run:
 
 ```bash
-bun index.ts -r 1 -w 1 -c 1 -d 5
+bun index.ts -r 2 -n 500000 -g 50000
 ```
 
-This project was created using `bun init` in bun v1.0.3. [Bun](https://bun.sh) is a fast all-in-one JavaScript runtime.

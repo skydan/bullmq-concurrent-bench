@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@strong-roots-capital/barrier": "^1.0.1",
-    "bullmq": "^4.12.0",
+    "@taskforcesh/bullmq-pro": "^7.2.0",
     "command-line-args": "^5.2.1"
   }
 }

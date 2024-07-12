@@ -1,4 +1,4 @@
-import { Queue, Worker } from 'bullmq';
+import { QueuePro, WorkerPro } from '@taskforcesh/bullmq-pro';
 import { Worker as WorkerThread, isMainThread, workerData, parentPort } from 'node:worker_threads';
 import makeBarrier from '@strong-roots-capital/barrier';
 
@@ -7,8 +7,9 @@ interface Options {
   readers: number;
   duration: number;
   concurrency: number;
-  queues: number;
+  groups: number;
   hostname: string;
+  port: number;
   numJobs: number;
 }
 
@@ -17,16 +18,18 @@ function sleep(seconds: number) {
 }
 
 async function WriterMain(options: Options) {
-  let queued = 0;
-  const queues = [];
-
-  for (let i = 0; i < options.queues; ++i) {
-    queues.push(new Queue(
-      `{queue${i}}`,
+  const queue = new QueuePro(
+      `{grouped_queue}`,
       {
-        connection: { host: options.hostname },
+        connection: {host: options.hostname, port: options.port },
         prefix: 'b',
-      }));
+      });
+
+  const groups = [];
+  const groupSequences = {} as Record<string, number>;
+
+  for (let i = 0; i < options.groups; ++i) {
+    groups.push("g" + i);
   }
 
   let barrier = makeBarrier(1);
@@ -41,67 +44,77 @@ async function WriterMain(options: Options) {
   parentPort.postMessage('ready');
   await barrier();
 
-  let adding = [];
-  const start = Date.now();
-
   // Wait in chunks to avoid blocking the event loop
   const chunkSize = 2000;
-  while (start + options.duration * 1000 > Date.now()) {
-    for (const queue of queues) {
-      adding.push(queue.add('job name', { param1: 'value1', param2: 'value2' }));
-    }
-    queued += queues.length;
+  const groupChunkSize = 1000;
 
-    if (adding.length > chunkSize) {
-      await Promise.all(adding);
-      adding = [];
+  let queued = 0;
+
+  while (queued < options.numJobs) {
+    for (let i = 0; i < groups.length; i += groupChunkSize) {
+      const groupChunk = groups.slice(i, i + groupChunkSize);
+      const adding = [];
+
+      for (const group of groupChunk) {
+        const seq = groupSequences[group] || 0;
+        adding.push(queue.add('job name', { param1: 'value1', seq }, { group: { id: group } }));
+        groupSequences[group] = seq + 1;
+        queued++;
+
+        if (adding.length >= chunkSize) {
+          await Promise.all(adding);
+          adding.length = 0;
+        }
+
+        if (queued >= options.numJobs) break;
+      }
+
+      if (adding.length > 0) {
+        await Promise.all(adding);
+      }
+
+      if (queued >= options.numJobs) break;
     }
   }
 
-  await Promise.all(adding);
-
-  let waits2 = [];
-  for (let queue of queues) {
-    waits2.push(queue.close());
-  }
-  await Promise.all(waits2);
+  await queue.close();
   parentPort.postMessage(queued);
 }
 
-async function ReaderMain(options: Options) {
+async function ReaderMain(index: number, targetJobsNum: number, options: Options) {
   let read = 0;
   let isClosing= false;
-  let workers = []
-  for (let i = 0; i < options.queues; ++i) {
-    const queue_name = `{queue${i}}`;
-    workers.push(
-      new Worker(
-        queue_name,
-        async job => {
-          if (isClosing) {
-            // Since we are closing we should not count this job
-            // as time has already expired.
-            return;
-          }
-          ++read;
-        },
-        {
-          connection: { host: options.hostname },
-          concurrency: options.concurrency,
-          prefix: 'b',
-        }
-      )
-    );
-  }
 
-  await sleep(options.duration);
+  let barrier = makeBarrier();
+  const worker = new WorkerPro(
+    `{grouped_queue}`,
+    async job => {
+      if (isClosing) {
+        // Since we are closing we should not count this job
+        // as time has already expired.
+        return;
+      }
+      // await sleep(Math.random() * 0.010);
+      if (job.opts.group?.id === 'g0') {
+        console.log('t:', index, ':', job.opts.group?.id, ':', job.data.seq);
+      }
+      if (++read >= targetJobsNum) barrier();
+    },
+    {
+      connection: {host: options.hostname, port: options.port},
+      group: {
+        concurrency: 1 // Limit to max 1 parallel jobs per group
+      },
+      concurrency: options.concurrency,
+      prefix: 'b',
+      removeOnComplete: {count: 0},
+      removeOnFail: {count: 0},
+    }
+  )
+  await barrier();
 
-  const closing = [];
-  for (let worker of workers) {
-    closing.push(worker.close());
-  }
   isClosing = true;
-  await Promise.all(closing);
+  await worker.close();
   if (!parentPort) {
     throw new Error('parentPort is null');
   }
@@ -123,9 +136,11 @@ async function main() {
     { name: 'writers', alias: 'w', type: Number, defaultValue: 1 },
     { name: 'readers', alias: 'r', type: Number, defaultValue: 1 },
     { name: 'duration', alias: 'd', type: Number, defaultValue: 1 },
-    { name: 'queues', alias: 'q', type: Number, defaultValue: 1 },
+    { name: 'numJobs', alias: 'n', type: Number, defaultValue: 500_000 },
+    { name: 'groups', alias: 'g', type: Number, defaultValue: 1 },
     { name: 'concurrency', alias: 'c', type: Number, defaultValue: 1 },
     { name: 'hostname', alias: 'h', type: String, defaultValue: 'localhost' },
+    { name: 'port', alias: 'p', type: Number, defaultValue: 6379 },
   ];
   const options: Options = commandLineArgs(optionDefinitions);
 
@@ -136,6 +151,8 @@ async function main() {
   console.log(`Initializing ${options.writers} writers`);
   let writes: number[] = [];
   let writers = [];
+  let start = process.hrtime();
+
   for (let i = 0; i < options.writers; ++i) {
     let worker = new WorkerThread(__filename, { workerData: { type: 'writer', options } });
     writers.push(worker);
@@ -158,13 +175,19 @@ async function main() {
   }
 
   await barrier();
+  let diff = process.hrtime(start);
+  const durW = diff[0] * 1e3 + diff[1] * 1e-6;
+  console.log(`Writers finished in ${durW.toFixed(0)}ms`);
 
   barrier = makeBarrier(options.readers);
   const readers = options.readers;
   console.log(`Initializing ${readers} readers`);
   let reads: number[] = [];
+
+  start = process.hrtime();
+
   for (let i = 0; i < readers; ++i) {
-    let worker = new WorkerThread(__filename, { workerData: { type: 'reader', options } });
+    let worker = new WorkerThread(__filename, { workerData: { type: 'reader', index: i, target: options.numJobs / readers, options } });
     worker.once('message', (value) => {
       reads.push(value);
       barrier();
@@ -173,12 +196,14 @@ async function main() {
 
   await barrier();
 
-  console.log(`Threads finished`);
+  diff = process.hrtime(start);
+  const durR = diff[0] * 1e3 + diff[1] * 1e-6;
+  console.log(`Readers finished in ${durR.toFixed(0)}ms`);
 
   const total_writes = writes.reduce((sum, a) => sum += a, 0);
-  console.log(`Total writes: ${PrintNumber(total_writes, options.duration)}`);
+  console.log(`Total writes: ${PrintNumber(total_writes, durW / 1000)}`);
   const total_reads = reads.reduce((sum, a) => sum += a, 0);
-  console.log(`Total reads: ${PrintNumber(total_reads, options.duration)}`);
+  console.log(`Total reads: ${PrintNumber(total_reads, durR / 1000)}`);
 }
 
 if (isMainThread) {
@@ -189,7 +214,7 @@ if (isMainThread) {
       WriterMain(workerData.options).catch(console.error);
       break;
     case 'reader':
-      ReaderMain(workerData.options).catch(console.error);
+      ReaderMain(workerData.index, workerData.target, workerData.options).catch(console.error);
       break;
     default:
       throw new Error(`Unknown type ${workerData.type}`);
